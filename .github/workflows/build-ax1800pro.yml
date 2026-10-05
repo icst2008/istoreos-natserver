@@ -294,6 +294,25 @@ jobs:
           # 所以只能像这样编进固件，没有「下载安装包单独装」这条路。
           # ===============================================================
           CONFIG_PACKAGE_kmod-tun=y
+
+          # ===============================================================
+          # K. USB 摄像头（UVC / V4L2）
+          # 本机有 USB 3.0 口，接 UVC 免驱摄像头需要两个内核模块：
+          #   kmod-video-core → videodev.ko（V4L2 核心）
+          #   kmod-video-uvc  → uvcvideo.ko（USB Video Class 驱动）
+          # 两者就位后，插入摄像头即出现 /dev/video0，可直接推流。
+          # 和 kmod-tun 同理：外部预编译的 kmod 一律不可用（内核哈希必须与
+          # 本固件一致），所以必须在这里编进固件，没有刷机后单独补装这条路。
+          # v4l-utils 提供 v4l2-ctl，用来列分辨率/像素格式、排障（可选但有用）。
+          #
+          # 下面两行是推流程序，属**用户态**包（不受内核哈希限制，刷机后也能
+          # 自装）。想让固件自带就取消注释；否则刷完用 Docker 跑 go2rtc 即可。
+          #   # CONFIG_PACKAGE_ustreamer=y
+          #   # CONFIG_PACKAGE_mjpg-streamer=y
+          # ===============================================================
+          CONFIG_PACKAGE_kmod-video-core=y
+          CONFIG_PACKAGE_kmod-video-uvc=y
+          CONFIG_PACKAGE_v4l-utils=y
           EOF
 
       - name: 展开默认配置并校验机型 (defconfig + verify)
@@ -462,6 +481,41 @@ jobs:
             exit 1
           fi
           echo "TUN 支持校验通过：kmod-tun 已入固件"
+
+          # USB 摄像头（UVC / V4L2）必须真的进固件：videodev.ko + uvcvideo.ko，
+          # 缺一个，刷机后插上摄像头也不会有 /dev/video0。
+          # 这里显式点名并**硬失败**，避免「以为编进去了、其实被 defconfig 丢弃」。
+          # 失败时打印诊断：这类失败通常是内核侧没有开启
+          # MEDIA_SUPPORT / USB_VIDEO_CLASS，需查 build.log 里该包的编译输出。
+          UVC_MISS=0
+          for k in kmod-video-core kmod-video-uvc; do
+            if grep -q "^${k} " "$MANIFEST"; then
+              echo "  ok      ${k}"
+            else
+              echo "  MISSING ${k}"
+              UVC_MISS=1
+            fi
+          done
+
+          if [ "$UVC_MISS" -ne 0 ]; then
+            echo "::error::manifest 中缺少 USB 摄像头（UVC）内核模块，插上摄像头不会有 /dev/video0"
+            echo "::group::诊断"
+            for k in kmod-video-core kmod-video-uvc; do
+              echo "--- ${k}"
+              grep -E "^CONFIG_PACKAGE_${k}=" .config || echo "    .config 中无此符号（被 defconfig 丢弃，或符号名有误）"
+              ls -l bin/targets/qualcommax/ipq60xx/kmods/*/${k}-*.apk 2>/dev/null || echo "    kmods 目录下无该包产物"
+              if ./scripts/feeds list -n 2>/dev/null | grep -x "$k" >/dev/null; then
+                echo "    feeds 中有此包"
+              else
+                echo "    feeds 中未找到此包"
+              fi
+            done
+            echo "::endgroup::"
+            echo "提示：若 feeds 中有此包但 .config 里没有，多半是内核配置未开启"
+            echo "      MEDIA_SUPPORT / USB_VIDEO_CLASS，请查 build.log 中 kmod-video-uvc 的编译输出。"
+            exit 1
+          fi
+          echo "USB 摄像头校验通过：kmod-video-core + kmod-video-uvc 均已入固件"
 
       - name: 校验服务自启 (Verify services are enabled at first boot)
         run: |
@@ -743,6 +797,7 @@ jobs:
             echo "### 固件包含"
             echo
             echo "- TUN/TAP 虚拟网卡（kmod-tun）：TUN 模式代理可直接使用"
+            echo "- USB 摄像头（UVC / V4L2）：kmod-video-core + kmod-video-uvc，插入 UVC 摄像头即出现 /dev/video0"
             echo "- daed 底层内核支持（BTF / XDP / BPF），daed 本体刷机后自行安装"
             echo
             echo "### 刷机"
